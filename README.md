@@ -148,14 +148,15 @@ Use these label names in the project config:
 
 The export directory is `LABEL_STUDIO_EXPORT_DIR`, or
 `~/.local/state/label-studio-mcp/exports` by default. The directory must be
-private. The tool refuses a directory that the current user does not own or
-that is accessible by group or other. `output_path` must contain only letters,
-digits, dot, underscore, or hyphen, at most 200 characters.
+private. On POSIX, the tool refuses a directory that the current user does not
+own or that is accessible by group or other. `output_path` must contain only
+letters, digits, dot, underscore, or hyphen, at most 200 characters.
 
 The tool creates the file with mode 0600 on POSIX and never overwrites an
-existing file. It budgets the indented JSON, stops at 16 MB, 10,000
-annotations, or `max_tasks`, and reports `truncated`. The reported `bytes`
-value is the file size. The `path` value is an absolute local path.
+existing file. It budgets the serialized JSON, stops at 16 MB, 10,000
+annotations, or `max_tasks`, and reports `truncated`. The tool result's `bytes`
+value is the file size. The written JSON carries `budgeted_bytes`. The `path`
+value is an absolute local path.
 
 The export contains task data, annotations, predictions, and annotator IDs.
 Delete old exports when they are no longer needed. On Windows the 0600 mode is

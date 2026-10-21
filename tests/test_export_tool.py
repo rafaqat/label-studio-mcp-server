@@ -37,8 +37,14 @@ class FakeTasks:
     def __init__(self, tasks):
         self._tasks = tasks
 
-    def list(self, project, page_size=100):
+    def list(self, project, page_size=100, fields="all"):
         return self._tasks
+
+    def get(self, id):
+        for task in self._tasks:
+            if task.id == id:
+                return task
+        raise KeyError(id)
 
 
 class CountingTasks:
@@ -46,7 +52,7 @@ class CountingTasks:
         self._tasks = tasks
         self.consumed = 0
 
-    def list(self, project, page_size=100):
+    def list(self, project, page_size=100, fields="all"):
         return self
 
     def __iter__(self):
@@ -66,9 +72,20 @@ class FakeProject:
     task_number = 2
 
 
+class FakeProjectNoCount:
+    id = 1
+    title = "Generative UI review without a task count"
+    task_number = None
+
+
 class FakeProjects:
     def get(self, id):
         return FakeProject()
+
+
+class FakeProjectsNoCount:
+    def get(self, id):
+        return FakeProjectNoCount()
 
 
 class FakeLabelStudio:
@@ -277,6 +294,37 @@ def test_max_tasks_does_not_fetch_an_extra_task(tmp_path, monkeypatch):
     summary = json.loads(result)
     assert summary["task_count"] == 1
     assert fake.tasks.consumed == 1
+
+
+def test_max_tasks_sets_truncated_without_a_task_number(tmp_path, monkeypatch):
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(tmp_path))
+    fake = FakeLabelStudio()
+    fake.projects = FakeProjectsNoCount()
+    fake.tasks = FakeTasks([
+        FakeTask(1, {"eval_case_id": "one"}, []),
+        FakeTask(2, {"eval_case_id": "two"}, []),
+        FakeTask(3, {"eval_case_id": "three"}, []),
+    ])
+
+    with patch.object(mcp_server, "ls", fake):
+        result = mcp_server.export_label_studio_project_annotations_tool(
+            project_id=1,
+            output_path="partial.json",
+            max_tasks=2,
+        )
+
+    summary = json.loads(result)
+    assert summary["task_count"] == 2
+    assert summary["truncated"] is True
+
+
+def test_task_annotations_tool_uses_the_sdk_field():
+    with patch.object(mcp_server, "ls", FakeLabelStudio()):
+        payload = json.loads(
+            mcp_server.get_label_studio_task_annotations_tool(project_id=1, task_id=101)
+        )
+
+    assert payload[0]["result"][0]["from_name"] == "open_coding"
 
 
 def test_reported_bytes_match_the_written_file(tmp_path, monkeypatch):

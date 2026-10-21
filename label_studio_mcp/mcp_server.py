@@ -155,25 +155,11 @@ def get_label_studio_task_data_tool(project_id: int, task_id: int) -> str:
 def get_label_studio_task_annotations_tool(project_id: int, task_id: int) -> str:
     """Provides annotations for a specific Label Studio task (Tool version)."""
     task = ls.tasks.get(id=task_id)
-    
-    if not hasattr(task, 'get_annotations'):
-        raise AttributeError(f"Task object (id: {task_id}) does not have get_annotations method.")
-        
-    annotations = task.get_annotations()
-    # Assuming get_annotations returns a list of objects with model_dump or dict
-    serialized_annotations = []
-    for anno in annotations:
-        if hasattr(anno, 'model_dump'):
-            serialized_annotations.append(anno.model_dump())
-        elif hasattr(anno, 'dict'):
-            serialized_annotations.append(anno.dict())
-        elif isinstance(anno, dict):
-            serialized_annotations.append(anno) # If already a dict
-        else:
-            # Fallback for unknown annotation format
-            serialized_annotations.append({"details": str(anno)})
-
-    return json.dumps(serialized_annotations)
+    annotations = [
+        _serialize_model(annotation)
+        for annotation in getattr(task, "annotations", []) or []
+    ]
+    return json.dumps(annotations)
 
 EXPORT_DIR_ENV = "LABEL_STUDIO_EXPORT_DIR"
 DEFAULT_EXPORT_DIR = Path.home() / ".local" / "state" / "label-studio-mcp" / "exports"
@@ -200,7 +186,10 @@ def _export_base_dir() -> Path:
 
 
 def _require_private_directory(base: Path) -> None:
-    info = base.stat()
+    _require_private_stat(base.stat())
+
+
+def _require_private_stat(info: os.stat_result) -> None:
     if not stat.S_ISDIR(info.st_mode):
         raise ValueError("export directory is not a directory.")
     if os.name == "nt":
@@ -254,9 +243,7 @@ def _open_export_file(base: Path, name: str) -> int:
         base_flags |= os.O_NOFOLLOW
     base_fd = os.open(str(base), base_flags)
     try:
-        info = os.fstat(base_fd)
-        if not stat.S_ISDIR(info.st_mode):
-            raise ValueError("export directory is not a directory.")
+        _require_private_stat(os.fstat(base_fd))
         return os.open(name, flags, 0o600, dir_fd=base_fd)
     finally:
         os.close(base_fd)
@@ -307,12 +294,14 @@ def export_label_studio_project_annotations_tool(
     tasks = []
     annotation_count = 0
     total_bytes = 0
+    consumed = 0
     truncated = False
     max_bytes = max(0, MAX_EXPORT_BYTES - BASE_OVERHEAD_BYTES)
 
     page_size = min(max_tasks, 100)
-    pager = ls.tasks.list(project=project_id, page_size=page_size)
+    pager = ls.tasks.list(project=project_id, page_size=page_size, fields="all")
     for task in itertools.islice(pager, max_tasks):
+        consumed += 1
         data = task.data if isinstance(getattr(task, "data", None), dict) else {}
         annotations = [
             _serialize_model(annotation)
@@ -339,7 +328,6 @@ def export_label_studio_project_annotations_tool(
             encoded = json.dumps(
                 exported_task,
                 ensure_ascii=False,
-                indent=2,
                 default=json_datetime_serializer,
             ).encode("utf-8")
         except (TypeError, ValueError) as error:
@@ -356,6 +344,9 @@ def export_label_studio_project_annotations_tool(
     task_number = getattr(project, "task_number", None)
     if task_number and task_number > len(tasks):
         truncated = True
+    elif not task_number and consumed >= max_tasks:
+        # No total from the server. A full max_tasks page may be partial.
+        truncated = True
 
     payload = {
         "project_id": project_id,
@@ -363,7 +354,7 @@ def export_label_studio_project_annotations_tool(
         "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "task_count": len(tasks),
         "annotation_count": annotation_count,
-        "bytes": total_bytes,
+        "budgeted_bytes": total_bytes,
         "truncated": truncated,
         "tasks": tasks,
     }
@@ -398,10 +389,9 @@ def export_label_studio_project_annotations_tool(
                 payload,
                 export_file,
                 ensure_ascii=False,
-                indent=2,
                 default=json_datetime_serializer,
             )
-    except (OSError, TypeError, ValueError) as error:
+    except Exception as error:
         try:
             target.unlink()
         except OSError:
