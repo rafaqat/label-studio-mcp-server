@@ -9,6 +9,9 @@ import functools
 from label_studio_sdk.label_interface import LabelInterface
 from pydantic import BaseModel
 import datetime
+import itertools
+import re
+import stat
 from pathlib import Path
 
 from .mcp_env import LABEL_STUDIO_URL, LABEL_STUDIO_API_KEY, ls
@@ -176,35 +179,87 @@ EXPORT_DIR_ENV = "LABEL_STUDIO_EXPORT_DIR"
 DEFAULT_EXPORT_DIR = Path.home() / ".local" / "state" / "label-studio-mcp" / "exports"
 MAX_EXPORT_BYTES = 16 * 1024 * 1024
 MAX_EXPORT_ANNOTATIONS = 10_000
+BASE_OVERHEAD_BYTES = 64 * 1024
+EXPORT_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9._-]{1,200}\Z")
+WINDOWS_RESERVED_NAMES = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
 
 
 def _export_base_dir() -> Path:
-    base = Path(os.environ.get(EXPORT_DIR_ENV, DEFAULT_EXPORT_DIR)).expanduser().resolve()
+    raw = os.environ.get(EXPORT_DIR_ENV, "").strip()
+    base = Path(raw or DEFAULT_EXPORT_DIR).expanduser().resolve()
+    created = not base.exists()
     base.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(base, 0o700)
+    if created:
+        os.chmod(base, 0o700)
+    _require_private_directory(base)
     return base
 
 
-def _safe_export_target(output_path: Optional[str], project_id: int) -> Path:
+def _require_private_directory(base: Path) -> None:
+    info = base.stat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("export directory is not a directory.")
+    if os.name == "nt":
+        return
+    if info.st_uid != os.getuid():
+        raise ValueError("export directory must be owned by the current user.")
+    if info.st_mode & 0o077:
+        raise ValueError("export directory must not be accessible by group or other.")
+
+
+def _safe_export_target(output_path: Optional[str], project_id: int) -> tuple[Path, str, Path]:
     base = _export_base_dir()
     if output_path is None:
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         name = f"project-{project_id}-{stamp}.json"
     else:
         raw = str(output_path)
-        if "\x00" in raw:
-            raise ValueError("output_path must not contain a null byte.")
-        if "/" in raw or "\\" in raw or raw in ("", ".", ".."):
-            raise ValueError("output_path must be a single file name, not a path.")
-        candidate = Path(raw)
-        if candidate.is_absolute() or candidate.name != raw:
-            raise ValueError("output_path must be a single file name, not a path.")
+        if raw in (".", "..") or not EXPORT_NAME_PATTERN.match(raw):
+            raise ValueError(
+                "output_path must use only letters, digits, dot, underscore, or hyphen."
+            )
+        if os.name == "nt" and raw.split(".")[0].upper() in WINDOWS_RESERVED_NAMES:
+            raise ValueError("output_path is a reserved Windows device name.")
         name = raw
 
     target = (base / name).resolve()
-    if os.path.commonpath([str(base), str(target)]) != str(base):
+    try:
+        inside = os.path.commonpath([str(base), str(target)]) == str(base)
+    except ValueError as error:
+        raise ValueError("output_path escapes the export directory.") from error
+    if not inside:
         raise ValueError("output_path escapes the export directory.")
-    return target
+    return base, name, target
+
+
+def _open_export_file(base: Path, name: str) -> int:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    supports_dir_fd = (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "supports_dir_fd")
+        and os.open in os.supports_dir_fd
+    )
+    if not supports_dir_fd:
+        return os.open(str(base / name), flags, 0o600)
+
+    base_flags = os.O_RDONLY | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        base_flags |= os.O_NOFOLLOW
+    base_fd = os.open(str(base), base_flags)
+    try:
+        info = os.fstat(base_fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("export directory is not a directory.")
+        return os.open(name, flags, 0o600, dir_fd=base_fd)
+    finally:
+        os.close(base_fd)
 
 
 @mcp.tool()
@@ -244,8 +299,8 @@ def export_label_studio_project_annotations_tool(
         return json.dumps({"error": "max_tasks must be between 1 and 2000."})
 
     try:
-        target = _safe_export_target(output_path, project_id)
-    except (OSError, ValueError) as error:
+        base, name, target = _safe_export_target(output_path, project_id)
+    except (OSError, ValueError, RuntimeError) as error:
         return json.dumps({"error": str(error)})
 
     project = ls.projects.get(id=project_id)
@@ -253,16 +308,15 @@ def export_label_studio_project_annotations_tool(
     annotation_count = 0
     total_bytes = 0
     truncated = False
+    max_bytes = max(0, MAX_EXPORT_BYTES - BASE_OVERHEAD_BYTES)
 
-    for task in ls.tasks.list(project=project_id):
-        if len(tasks) >= max_tasks:
-            truncated = True
-            break
-
+    page_size = min(max_tasks, 100)
+    pager = ls.tasks.list(project=project_id, page_size=page_size)
+    for task in itertools.islice(pager, max_tasks):
         data = task.data if isinstance(getattr(task, "data", None), dict) else {}
         annotations = [
             _serialize_model(annotation)
-            for annotation in task.get_annotations()
+            for annotation in getattr(task, "annotations", []) or []
         ]
         if annotation_count + len(annotations) > MAX_EXPORT_ANNOTATIONS:
             truncated = True
@@ -285,12 +339,13 @@ def export_label_studio_project_annotations_tool(
             encoded = json.dumps(
                 exported_task,
                 ensure_ascii=False,
+                indent=2,
                 default=json_datetime_serializer,
             ).encode("utf-8")
         except (TypeError, ValueError) as error:
             return json.dumps({"error": f"Task {task.id} is not JSON serializable: {error}"})
 
-        if total_bytes + len(encoded) > MAX_EXPORT_BYTES:
+        if total_bytes + len(encoded) > max_bytes:
             truncated = True
             break
 
@@ -313,21 +368,32 @@ def export_label_studio_project_annotations_tool(
         "tasks": tasks,
     }
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(target, flags, 0o600)
+        descriptor = _open_export_file(base, name)
     except FileExistsError:
         return json.dumps({
-            "error": f"Export file already exists: {target.name}. Choose another name."
+            "error": f"Export file already exists: {name}. Choose another name."
         })
+    except ValueError as error:
+        return json.dumps({"error": str(error)})
     except OSError as error:
         return json.dumps({"error": f"Could not create the export file: {error}"})
 
     try:
-        os.chmod(target, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as export_file:
+        export_file = os.fdopen(descriptor, "w", encoding="utf-8")
+    except Exception as error:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return json.dumps({"error": f"Could not open the export file: {error}"})
+
+    try:
+        with export_file:
             json.dump(
                 payload,
                 export_file,
@@ -337,22 +403,23 @@ def export_label_studio_project_annotations_tool(
             )
     except (OSError, TypeError, ValueError) as error:
         try:
-            os.close(descriptor)
-        except OSError:
-            pass
-        try:
             target.unlink()
         except OSError:
             pass
         return json.dumps({"error": f"Could not write the export file: {error}"})
 
+    try:
+        file_size = target.stat().st_size
+    except OSError:
+        file_size = total_bytes
+
     return json.dumps({
         "path": str(target),
-        "file_name": target.name,
+        "file_name": name,
         "project_id": project_id,
         "task_count": len(tasks),
         "annotation_count": annotation_count,
-        "bytes": total_bytes,
+        "bytes": file_size,
         "truncated": truncated,
     })
 
