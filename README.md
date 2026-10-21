@@ -154,9 +154,10 @@ letters, digits, dot, underscore, or hyphen, at most 200 characters.
 
 The tool creates the file with mode 0600 on POSIX and never overwrites an
 existing file. It budgets the serialized JSON, stops at 16 MB, 10,000
-annotations, or `max_tasks`, and reports `truncated`. The tool result's `bytes`
-value is the file size. The written JSON carries `budgeted_bytes`. The `path`
-value is an absolute local path.
+annotations, or `max_tasks`, and reports `truncated`. The project title is
+capped at 500 characters. The tool result's `bytes` value is the file size.
+The written JSON carries `budgeted_bytes`. The `path` value is an absolute
+local path. The export directory must not be a symlink.
 
 The export contains task data, annotations, predictions, and annotator IDs.
 Delete old exports when they are no longer needed. On Windows the 0600 mode is

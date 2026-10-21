@@ -176,7 +176,10 @@ WINDOWS_RESERVED_NAMES = (
 
 def _export_base_dir() -> Path:
     raw = os.environ.get(EXPORT_DIR_ENV, "").strip()
-    base = Path(raw or DEFAULT_EXPORT_DIR).expanduser().resolve()
+    configured = Path(raw or DEFAULT_EXPORT_DIR).expanduser()
+    if configured.is_symlink():
+        raise ValueError("export directory must not be a symlink.")
+    base = configured.resolve()
     created = not base.exists()
     if created:
         try:
@@ -357,6 +360,7 @@ def export_label_studio_project_annotations_tool(
 
     title = getattr(project, "title", None)
     if isinstance(title, str):
+        # The bound keeps a malformed server title inside the byte budget.
         title = title[:500]
 
     payload = {

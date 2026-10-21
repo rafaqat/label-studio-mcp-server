@@ -424,6 +424,25 @@ def test_rejects_a_shared_export_directory(tmp_path, monkeypatch):
     assert "group or other" in json.loads(result)["error"]
 
 
+def test_rejects_a_symlinked_export_directory(tmp_path, monkeypatch):
+    if os.name == "nt":
+        return
+
+    target = tmp_path / "real"
+    target.mkdir(mode=0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(link))
+
+    with patch.object(mcp_server, "ls", FakeLabelStudio()):
+        result = mcp_server.export_label_studio_project_annotations_tool(
+            project_id=1,
+            output_path="feedback.json",
+        )
+
+    assert "symlink" in json.loads(result)["error"]
+
+
 def test_empty_export_dir_uses_the_default(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "DEFAULT_EXPORT_DIR", tmp_path / "default")
     monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, "")
