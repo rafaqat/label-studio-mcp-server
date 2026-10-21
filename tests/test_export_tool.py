@@ -1,4 +1,5 @@
 import json
+import stat
 from unittest.mock import patch
 
 from label_studio_mcp import mcp_server
@@ -108,13 +109,14 @@ class FakeLabelStudio:
         ])
 
 
-def test_exports_tasks_and_annotations(tmp_path):
+def test_exports_tasks_and_annotations(tmp_path, monkeypatch):
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(tmp_path))
     output = tmp_path / "feedback.json"
 
     with patch.object(mcp_server, "ls", FakeLabelStudio()):
         result = mcp_server.export_label_studio_project_annotations_tool(
             project_id=1,
-            output_path=str(output),
+            output_path="feedback.json",
         )
 
     summary = json.loads(result)
@@ -122,6 +124,8 @@ def test_exports_tasks_and_annotations(tmp_path):
     assert summary["annotation_count"] == 2
     assert summary["truncated"] is False
     assert summary["path"] == str(output.resolve())
+    assert summary["file_name"] == "feedback.json"
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
 
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["project_id"] == 1
@@ -143,3 +147,65 @@ def test_rejects_invalid_max_tasks():
         )
 
     assert "error" in json.loads(result)
+
+
+def test_rejects_paths_outside_the_export_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(tmp_path / "exports"))
+
+    with patch.object(mcp_server, "ls", FakeLabelStudio()):
+        for value in ("../escape.json", "/tmp/escape.json", "sub/escape.json", "..", ""):
+            result = mcp_server.export_label_studio_project_annotations_tool(
+                project_id=1,
+                output_path=value,
+            )
+            assert "error" in json.loads(result), value
+
+    assert not (tmp_path / "escape.json").exists()
+
+
+def test_does_not_overwrite_an_existing_file(tmp_path, monkeypatch):
+    base = tmp_path / "exports"
+    base.mkdir()
+    target = base / "feedback.json"
+    target.write_text("keep", encoding="utf-8")
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(base))
+
+    with patch.object(mcp_server, "ls", FakeLabelStudio()):
+        result = mcp_server.export_label_studio_project_annotations_tool(
+            project_id=1,
+            output_path="feedback.json",
+        )
+
+    assert "already exists" in json.loads(result)["error"]
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_stops_at_the_byte_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(mcp_server, "MAX_EXPORT_BYTES", 10)
+
+    with patch.object(mcp_server, "ls", FakeLabelStudio()):
+        result = mcp_server.export_label_studio_project_annotations_tool(
+            project_id=1,
+            output_path="feedback.json",
+        )
+
+    summary = json.loads(result)
+    assert summary["task_count"] == 0
+    assert summary["truncated"] is True
+
+
+def test_stops_at_the_annotation_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(mcp_server, "MAX_EXPORT_ANNOTATIONS", 1)
+
+    with patch.object(mcp_server, "ls", FakeLabelStudio()):
+        result = mcp_server.export_label_studio_project_annotations_tool(
+            project_id=1,
+            output_path="feedback.json",
+        )
+
+    summary = json.loads(result)
+    assert summary["task_count"] == 1
+    assert summary["annotation_count"] == 1
+    assert summary["truncated"] is True

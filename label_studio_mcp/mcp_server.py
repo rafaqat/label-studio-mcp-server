@@ -9,6 +9,7 @@ import functools
 from label_studio_sdk.label_interface import LabelInterface
 from pydantic import BaseModel
 import datetime
+from pathlib import Path
 
 from .mcp_env import LABEL_STUDIO_URL, LABEL_STUDIO_API_KEY, ls
 
@@ -171,6 +172,41 @@ def get_label_studio_task_annotations_tool(project_id: int, task_id: int) -> str
 
     return json.dumps(serialized_annotations)
 
+EXPORT_DIR_ENV = "LABEL_STUDIO_EXPORT_DIR"
+DEFAULT_EXPORT_DIR = Path.home() / ".local" / "state" / "label-studio-mcp" / "exports"
+MAX_EXPORT_BYTES = 16 * 1024 * 1024
+MAX_EXPORT_ANNOTATIONS = 10_000
+
+
+def _export_base_dir() -> Path:
+    base = Path(os.environ.get(EXPORT_DIR_ENV, DEFAULT_EXPORT_DIR)).expanduser().resolve()
+    base.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(base, 0o700)
+    return base
+
+
+def _safe_export_target(output_path: Optional[str], project_id: int) -> Path:
+    base = _export_base_dir()
+    if output_path is None:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        name = f"project-{project_id}-{stamp}.json"
+    else:
+        raw = str(output_path)
+        if "\x00" in raw:
+            raise ValueError("output_path must not contain a null byte.")
+        if "/" in raw or "\\" in raw or raw in ("", ".", ".."):
+            raise ValueError("output_path must be a single file name, not a path.")
+        candidate = Path(raw)
+        if candidate.is_absolute() or candidate.name != raw:
+            raise ValueError("output_path must be a single file name, not a path.")
+        name = raw
+
+    target = (base / name).resolve()
+    if os.path.commonpath([str(base), str(target)]) != str(base):
+        raise ValueError("output_path escapes the export directory.")
+    return target
+
+
 @mcp.tool()
 @require_ls_connection
 def export_label_studio_project_annotations_tool(
@@ -188,27 +224,39 @@ def export_label_studio_project_annotations_tool(
 
     Args:
         project_id (int): The Label Studio project ID.
-        output_path (Optional[str]): File path for the JSON export. Defaults to
-            ``label_studio_feedback/project-<id>-<timestamp>.json``.
+        output_path (Optional[str]): File name inside the export directory. It
+            must not contain a path separator. Defaults to
+            ``project-<id>-<timestamp>.json``. The directory is
+            ``LABEL_STUDIO_EXPORT_DIR`` or
+            ``~/.local/state/label-studio-mcp/exports``.
         include_predictions (bool): Include the task's predictions when
             available. Defaults to False.
         max_tasks (int): Safety cap between 1 and 2000. Defaults to 500.
 
     Returns:
-        JSON with the absolute path, task count, annotation count, and a
-        truncated flag.
+        JSON with the file path, task count, annotation count, byte count, and
+        a truncated flag. The file is created with mode 0600. An existing file
+        is never overwritten.
 
     Reference: Uses ls.projects.get and ls.tasks.list from the SDK v1.0+.
     """
     if max_tasks < 1 or max_tasks > 2000:
         return json.dumps({"error": "max_tasks must be between 1 and 2000."})
 
+    try:
+        target = _safe_export_target(output_path, project_id)
+    except (OSError, ValueError) as error:
+        return json.dumps({"error": str(error)})
+
     project = ls.projects.get(id=project_id)
     tasks = []
     annotation_count = 0
+    total_bytes = 0
+    truncated = False
 
     for task in ls.tasks.list(project=project_id):
         if len(tasks) >= max_tasks:
+            truncated = True
             break
 
         data = task.data if isinstance(getattr(task, "data", None), dict) else {}
@@ -216,7 +264,9 @@ def export_label_studio_project_annotations_tool(
             _serialize_model(annotation)
             for annotation in task.get_annotations()
         ]
-        annotation_count += len(annotations)
+        if annotation_count + len(annotations) > MAX_EXPORT_ANNOTATIONS:
+            truncated = True
+            break
 
         exported_task = {
             "task_id": task.id,
@@ -231,20 +281,26 @@ def export_label_studio_project_annotations_tool(
                 for prediction in getattr(task, "predictions", []) or []
             ]
 
+        try:
+            encoded = json.dumps(
+                exported_task,
+                ensure_ascii=False,
+                default=json_datetime_serializer,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            return json.dumps({"error": f"Task {task.id} is not JSON serializable: {error}"})
+
+        if total_bytes + len(encoded) > MAX_EXPORT_BYTES:
+            truncated = True
+            break
+
+        total_bytes += len(encoded)
+        annotation_count += len(annotations)
         tasks.append(exported_task)
 
     task_number = getattr(project, "task_number", None)
-    truncated = bool(task_number and task_number > len(tasks))
-
-    if output_path is None:
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        output_path = os.path.join(
-            "label_studio_feedback",
-            f"project-{project_id}-{stamp}.json",
-        )
-
-    absolute_path = os.path.abspath(output_path)
-    os.makedirs(os.path.dirname(absolute_path) or ".", exist_ok=True)
+    if task_number and task_number > len(tasks):
+        truncated = True
 
     payload = {
         "project_id": project_id,
@@ -252,24 +308,51 @@ def export_label_studio_project_annotations_tool(
         "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "task_count": len(tasks),
         "annotation_count": annotation_count,
+        "bytes": total_bytes,
         "truncated": truncated,
         "tasks": tasks,
     }
 
-    with open(absolute_path, "w", encoding="utf-8") as export_file:
-        json.dump(
-            payload,
-            export_file,
-            ensure_ascii=False,
-            indent=2,
-            default=json_datetime_serializer,
-        )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(target, flags, 0o600)
+    except FileExistsError:
+        return json.dumps({
+            "error": f"Export file already exists: {target.name}. Choose another name."
+        })
+    except OSError as error:
+        return json.dumps({"error": f"Could not create the export file: {error}"})
+
+    try:
+        os.chmod(target, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as export_file:
+            json.dump(
+                payload,
+                export_file,
+                ensure_ascii=False,
+                indent=2,
+                default=json_datetime_serializer,
+            )
+    except (OSError, TypeError, ValueError) as error:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return json.dumps({"error": f"Could not write the export file: {error}"})
 
     return json.dumps({
-        "path": absolute_path,
+        "path": str(target),
+        "file_name": target.name,
         "project_id": project_id,
         "task_count": len(tasks),
         "annotation_count": annotation_count,
+        "bytes": total_bytes,
         "truncated": truncated,
     })
 

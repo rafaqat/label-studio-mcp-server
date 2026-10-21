@@ -100,7 +100,7 @@ The MCP server exposes the following tools:
 *   **`list_label_studio_project_tasks_tool(project_id: int)`**: Lists task IDs within a project (up to 100).
 *   **`get_label_studio_task_data_tool(project_id: int, task_id: int)`**: Retrieves the data payload for a specific task.
 *   **`get_label_studio_task_annotations_tool(project_id: int, task_id: int)`**: Fetches existing annotations for a specific task.
-*   **`export_label_studio_project_annotations_tool(project_id: int, output_path: str = None, include_predictions: bool = False, max_tasks: int = 500)`**: Exports every task and its annotations to one JSON file. Use this for a human-feedback loop.
+*   **`export_label_studio_project_annotations_tool(project_id: int, output_path: str = None, include_predictions: bool = False, max_tasks: int = 500)`**: Exports every task and its annotations to one JSON file. `output_path` is a file name inside the export directory. Use this for a human-feedback loop.
 *   **`import_label_studio_project_tasks_tool(project_id: int, tasks_file_path: str)`**: Imports tasks from a JSON file (containing a list of task objects) into a project. Returns import summary and project URL.
 
 ### Predictions
@@ -145,6 +145,12 @@ Use these label names in the project config:
 - `pass_fail` (choices: Pass, Fail)
 - `reasoning_quality`, `tool_use_quality`, `ui_quality` (ratings)
 - `safety_review` (choices: Safe, Unsafe)
+
+The export directory is `LABEL_STUDIO_EXPORT_DIR`, or
+`~/.local/state/label-studio-mcp/exports` by default. `output_path` is a file
+name inside that directory. The tool creates the file with mode 0600 and never
+overwrites an existing file. It stops at a 16 MB byte budget, 10,000
+annotations, or `max_tasks`, and reports `truncated`.
 
 The SwiftUI Rails test app has a matching importer:
 

@@ -2,10 +2,10 @@ version = 1
 revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
+    "python_full_version >= '4'",
     "python_full_version >= '3.12' and python_full_version < '4'",
     "python_full_version == '3.11.*'",
     "python_full_version < '3.11'",
-    "python_full_version >= '4'",
 ]
 
 [[package]]
@@ -478,7 +478,7 @@ wheels = [
 
 [[package]]
 name = "label-studio-mcp"
-version = "0.2.0"
+version = "0.2.1"
 source = { virtual = "." }
 dependencies = [
     { name = "httpx" },
