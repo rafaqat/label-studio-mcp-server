@@ -159,7 +159,7 @@ def get_label_studio_task_annotations_tool(project_id: int, task_id: int) -> str
         _serialize_model(annotation)
         for annotation in getattr(task, "annotations", []) or []
     ]
-    return json.dumps(annotations)
+    return json.dumps(annotations, default=json_datetime_serializer)
 
 EXPORT_DIR_ENV = "LABEL_STUDIO_EXPORT_DIR"
 DEFAULT_EXPORT_DIR = Path.home() / ".local" / "state" / "label-studio-mcp" / "exports"
@@ -178,9 +178,13 @@ def _export_base_dir() -> Path:
     raw = os.environ.get(EXPORT_DIR_ENV, "").strip()
     base = Path(raw or DEFAULT_EXPORT_DIR).expanduser().resolve()
     created = not base.exists()
-    base.mkdir(mode=0o700, parents=True, exist_ok=True)
     if created:
-        os.chmod(base, 0o700)
+        try:
+            base.mkdir(mode=0o700, parents=True, exist_ok=False)
+        except FileExistsError as error:
+            raise ValueError("export directory changed during setup.") from error
+        if base.is_symlink():
+            raise ValueError("export directory must not be a symlink.")
     _require_private_directory(base)
     return base
 
@@ -347,10 +351,17 @@ def export_label_studio_project_annotations_tool(
     elif not task_number and consumed >= max_tasks:
         # No total from the server. A full max_tasks page may be partial.
         truncated = True
+    elif task_number and task_number < consumed:
+        # A stale count cannot prove the export is complete.
+        truncated = True
+
+    title = getattr(project, "title", None)
+    if isinstance(title, str):
+        title = title[:500]
 
     payload = {
         "project_id": project_id,
-        "project_title": getattr(project, "title", None),
+        "project_title": title,
         "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "task_count": len(tasks),
         "annotation_count": annotation_count,

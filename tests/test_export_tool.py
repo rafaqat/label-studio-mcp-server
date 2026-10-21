@@ -1,3 +1,4 @@
+import datetime
 import json
 import os
 import stat
@@ -11,8 +12,8 @@ class FakeAnnotation:
         self.annotation_id = annotation_id
         self.result = result
         self.completed_by = 7
-        self.created_at = "2026-10-21T10:00:00Z"
-        self.updated_at = "2026-10-21T10:05:00Z"
+        self.created_at = datetime.datetime(2026, 10, 21, 10, 0, tzinfo=datetime.timezone.utc)
+        self.updated_at = datetime.datetime(2026, 10, 21, 10, 5, tzinfo=datetime.timezone.utc)
         self.was_cancelled = False
 
     def model_dump(self):
@@ -86,6 +87,24 @@ class FakeProjects:
 class FakeProjectsNoCount:
     def get(self, id):
         return FakeProjectNoCount()
+
+
+class FakeProjectHugeTitle(FakeProject):
+    title = "x" * 100_000
+
+
+class FakeProjectsHugeTitle:
+    def get(self, id):
+        return FakeProjectHugeTitle()
+
+
+class FakeProjectStaleCount(FakeProject):
+    task_number = 1
+
+
+class FakeProjectsStaleCount:
+    def get(self, id):
+        return FakeProjectStaleCount()
 
 
 class FakeLabelStudio:
@@ -316,6 +335,49 @@ def test_max_tasks_sets_truncated_without_a_task_number(tmp_path, monkeypatch):
     summary = json.loads(result)
     assert summary["task_count"] == 2
     assert summary["truncated"] is True
+
+
+def test_stale_task_count_sets_truncated(tmp_path, monkeypatch):
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(tmp_path))
+    fake = FakeLabelStudio()
+    fake.projects = FakeProjectsStaleCount()
+    fake.tasks = FakeTasks([
+        FakeTask(1, {"eval_case_id": "one"}, []),
+        FakeTask(2, {"eval_case_id": "two"}, []),
+        FakeTask(3, {"eval_case_id": "three"}, []),
+    ])
+
+    with patch.object(mcp_server, "ls", fake):
+        result = mcp_server.export_label_studio_project_annotations_tool(
+            project_id=1,
+            output_path="stale.json",
+            max_tasks=2,
+        )
+
+    summary = json.loads(result)
+    assert summary["task_count"] == 2
+    assert summary["truncated"] is True
+
+
+def test_huge_title_stays_within_the_byte_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv(mcp_server.EXPORT_DIR_ENV, str(tmp_path))
+    monkeypatch.setattr(mcp_server, "MAX_EXPORT_BYTES", 12_000)
+    monkeypatch.setattr(mcp_server, "BASE_OVERHEAD_BYTES", 1_024)
+    fake = FakeLabelStudio()
+    fake.projects = FakeProjectsHugeTitle()
+
+    with patch.object(mcp_server, "ls", fake):
+        result = mcp_server.export_label_studio_project_annotations_tool(
+            project_id=1,
+            output_path="title.json",
+        )
+
+    summary = json.loads(result)
+    size = (tmp_path / "title.json").stat().st_size
+    payload = json.loads((tmp_path / "title.json").read_text(encoding="utf-8"))
+    assert size <= 12_000
+    assert len(payload["project_title"]) == 500
+    assert summary["bytes"] == size
 
 
 def test_task_annotations_tool_uses_the_sdk_field():
