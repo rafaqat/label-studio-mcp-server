@@ -46,6 +46,17 @@ def json_datetime_serializer(obj):
         return obj.isoformat()
     raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
+
+def _serialize_model(value: Any) -> Any:
+    """Convert an SDK model object to a JSON-safe dictionary."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    if isinstance(value, dict):
+        return value
+    return {"details": str(value)}
+
 # ============================================
 # == Label Studio Tool Definitions          ==
 # ============================================
@@ -159,6 +170,109 @@ def get_label_studio_task_annotations_tool(project_id: int, task_id: int) -> str
             serialized_annotations.append({"details": str(anno)})
 
     return json.dumps(serialized_annotations)
+
+@mcp.tool()
+@require_ls_connection
+def export_label_studio_project_annotations_tool(
+    project_id: int,
+    output_path: Optional[str] = None,
+    include_predictions: bool = False,
+    max_tasks: int = 500,
+) -> str:
+    """Exports every task and its annotations to one JSON file.
+
+    Use this to close a human-feedback loop. Put ``eval_case_id`` and
+    ``trace_id`` in each task's data when you import the tasks. The exported
+    file then maps a Label Studio annotation back to the eval case and its
+    trace.
+
+    Args:
+        project_id (int): The Label Studio project ID.
+        output_path (Optional[str]): File path for the JSON export. Defaults to
+            ``label_studio_feedback/project-<id>-<timestamp>.json``.
+        include_predictions (bool): Include the task's predictions when
+            available. Defaults to False.
+        max_tasks (int): Safety cap between 1 and 2000. Defaults to 500.
+
+    Returns:
+        JSON with the absolute path, task count, annotation count, and a
+        truncated flag.
+
+    Reference: Uses ls.projects.get and ls.tasks.list from the SDK v1.0+.
+    """
+    if max_tasks < 1 or max_tasks > 2000:
+        return json.dumps({"error": "max_tasks must be between 1 and 2000."})
+
+    project = ls.projects.get(id=project_id)
+    tasks = []
+    annotation_count = 0
+
+    for task in ls.tasks.list(project=project_id):
+        if len(tasks) >= max_tasks:
+            break
+
+        data = task.data if isinstance(getattr(task, "data", None), dict) else {}
+        annotations = [
+            _serialize_model(annotation)
+            for annotation in task.get_annotations()
+        ]
+        annotation_count += len(annotations)
+
+        exported_task = {
+            "task_id": task.id,
+            "eval_case_id": data.get("eval_case_id"),
+            "data": data,
+            "annotations": annotations,
+        }
+
+        if include_predictions:
+            exported_task["predictions"] = [
+                _serialize_model(prediction)
+                for prediction in getattr(task, "predictions", []) or []
+            ]
+
+        tasks.append(exported_task)
+
+    task_number = getattr(project, "task_number", None)
+    truncated = bool(task_number and task_number > len(tasks))
+
+    if output_path is None:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        output_path = os.path.join(
+            "label_studio_feedback",
+            f"project-{project_id}-{stamp}.json",
+        )
+
+    absolute_path = os.path.abspath(output_path)
+    os.makedirs(os.path.dirname(absolute_path) or ".", exist_ok=True)
+
+    payload = {
+        "project_id": project_id,
+        "project_title": getattr(project, "title", None),
+        "exported_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "task_count": len(tasks),
+        "annotation_count": annotation_count,
+        "truncated": truncated,
+        "tasks": tasks,
+    }
+
+    with open(absolute_path, "w", encoding="utf-8") as export_file:
+        json.dump(
+            payload,
+            export_file,
+            ensure_ascii=False,
+            indent=2,
+            default=json_datetime_serializer,
+        )
+
+    return json.dumps({
+        "path": absolute_path,
+        "project_id": project_id,
+        "task_count": len(tasks),
+        "annotation_count": annotation_count,
+        "truncated": truncated,
+    })
+
 
 @mcp.tool()
 @require_ls_connection

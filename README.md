@@ -15,6 +15,7 @@ This project provides a Model Context Protocol (MCP) server that allows interact
 
 *   **Project Management**: Create, update, list, and view details/configurations of Label Studio projects.
 *   **Task Management**: Import tasks from files, list tasks within projects, and retrieve task data/annotations.
+*   **Annotation Export**: Export every task and its annotations to one JSON file for human-feedback loops.
 *   **Prediction Integration**: Add model predictions to specific tasks.
 *   **SDK Integration**: Leverages the official `label-studio-sdk` for communication.
 
@@ -99,6 +100,7 @@ The MCP server exposes the following tools:
 *   **`list_label_studio_project_tasks_tool(project_id: int)`**: Lists task IDs within a project (up to 100).
 *   **`get_label_studio_task_data_tool(project_id: int, task_id: int)`**: Retrieves the data payload for a specific task.
 *   **`get_label_studio_task_annotations_tool(project_id: int, task_id: int)`**: Fetches existing annotations for a specific task.
+*   **`export_label_studio_project_annotations_tool(project_id: int, output_path: str = None, include_predictions: bool = False, max_tasks: int = 500)`**: Exports every task and its annotations to one JSON file. Use this for a human-feedback loop.
 *   **`import_label_studio_project_tasks_tool(project_id: int, tasks_file_path: str)`**: Imports tasks from a JSON file (containing a list of task objects) into a project. Returns import summary and project URL.
 
 ### Predictions
@@ -115,7 +117,44 @@ The MCP server exposes the following tools:
 6.  Generate a prediction result structure (list of dicts).
 7.  Add the prediction using `create_label_studio_prediction_tool`.
 
+## Human feedback loop
 
+`export_label_studio_project_annotations_tool` writes one JSON file with every
+task, its data, and its annotations. Put `eval_case_id` and `trace_id` in each
+task's data when you import the tasks. The export then maps a human annotation
+back to the eval case and its trace.
+
+Example task data:
+
+```json
+{
+  "data": {
+    "eval_case_id": "invoice-overdue",
+    "trace_id": "trace-1",
+    "prompt": "Show overdue invoices.",
+    "kind": "invoice_list",
+    "model": "claude-opus-5-5",
+    "scores": { "pass_all": true }
+  }
+}
+```
+
+Use these label names in the project config:
+
+- `open_coding` (textarea)
+- `pass_fail` (choices: Pass, Fail)
+- `reasoning_quality`, `tool_use_quality`, `ui_quality` (ratings)
+- `safety_review` (choices: Safe, Unsafe)
+
+The SwiftUI Rails test app has a matching importer:
+
+```bash
+cd test_app
+bin/label-studio-feedback --export <path> --post-langfuse
+```
+
+It writes a Markdown and JSON report and can post the human labels to Langfuse.
+It does not rewrite the eval corpus.
 
 ## Contact
 

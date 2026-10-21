@@ -1,6 +1,6 @@
 [project]
 name = "label-studio-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Model Context Protocol (MCP) server for Label Studio"
 authors = [
     { name = "HumanSignal", email = "support@humansignal.com" },
@@ -24,8 +24,15 @@ dependencies = [
 [project.scripts]
 mcp-label-studio = "label_studio_mcp.main:main"
 
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
 [project.urls]
 Home = "https://github.com/HumanSignal/label-studio-mcp-server"
 
 [tool.setuptools]
 packages = ["label_studio_mcp"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
